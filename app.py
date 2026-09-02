@@ -99,15 +99,19 @@ class DB:
             self._c.row_factory = sqlite3.Row
             self._c.execute("PRAGMA foreign_keys = ON")
 
+    # Tables that have no "id" primary key, so RETURNING id would fail.
+    NO_ID_TABLES = ("paper_authors",)
+
     def execute(self, sql, params=()):
         want_id = False
         if USE_PG:
             sql = sql.replace("?", "%s")
             head = sql.strip().upper()
+            has_id = not any(t.upper() in head for t in self.NO_ID_TABLES)
             if head.startswith("INSERT OR IGNORE"):
                 sql = sql.replace("INSERT OR IGNORE", "INSERT", 1).rstrip().rstrip(";")
                 sql += " ON CONFLICT DO NOTHING"
-            elif head.startswith("INSERT"):
+            elif head.startswith("INSERT") and has_id:
                 sql = sql.rstrip().rstrip(";") + " RETURNING id"
                 want_id = True
         cur = self._c.cursor()
@@ -159,6 +163,7 @@ CREATE TABLE IF NOT EXISTS papers (
     last_auto_check TEXT,
     last_auto_result TEXT,
     notes TEXT,
+    fetched_details TEXT,
     owner_id INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -192,6 +197,11 @@ def init_db():
     ddl = SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY") if USE_PG else SCHEMA
     c = conn()
     c.executescript(ddl)
+    # migration for databases created before fetched_details existed
+    try:
+        c.execute("ALTER TABLE papers ADD COLUMN fetched_details TEXT")
+    except Exception:
+        pass
     c.commit()
     c.close()
 
@@ -328,40 +338,120 @@ AUTO_PATTERNS = [
 ]
 
 
-def fetch_status_from_link(url):
-    """Best effort. Returns (status_or_None, human_readable_note)."""
+def _visible_text(html):
+    txt = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.S | re.I)
+    txt = re.sub(r"<br\s*/?>|</tr>|</p>|</div>|</li>", "\n", txt, flags=re.I)
+    txt = re.sub(r"</t[dh]>", " | ", txt, flags=re.I)
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    txt = (txt.replace("&nbsp;", " ").replace("&amp;", "&")
+              .replace("&lt;", "<").replace("&gt;", ">").replace("&#39;", "'"))
+    lines = [re.sub(r"[ \t]+", " ", l).strip(" |") for l in txt.splitlines()]
+    return [l for l in lines if l.strip()]
+
+
+# Label keywords -> the field we can auto-fill. Everything else is still shown
+# to the user, just not mapped to a column.
+FIELD_HINTS = {
+    "manuscript_number": ("manuscript number", "manuscript no", "ms number", "ms id",
+                          "paper id", "submission id", "tracking number", "article number"),
+    "title": ("article title", "manuscript title", "title"),
+    "journal_name": ("journal", "publication"),
+    "date_submitted": ("date submitted", "submission date", "initial date submitted",
+                       "received", "date received", "submitted on"),
+    "status": ("current status", "status", "stage", "editorial status"),
+}
+
+
+def scrape_tracking_page(url):
+    """Pull every label/value pair we can find off a journal tracking page.
+
+    Returns (details, fields, note):
+      details -- ordered list of (label, value) exactly as shown on the page
+      fields  -- subset mapped onto our own columns
+      note    -- human readable outcome
+    """
     if requests is None:
-        return None, "The `requests` package is not installed."
+        return [], {}, "The `requests` package is not installed."
     if not url or not url.startswith(("http://", "https://")):
-        return None, "No valid tracking URL saved."
+        return [], {}, "No valid tracking URL saved."
     try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 PaperTrack/1.0"})
+        r = requests.get(url, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0 PaperTrack/1.0"})
     except Exception as e:
-        return None, f"Request failed: {e}"
-
+        return [], {}, f"Request failed: {e}"
     if r.status_code != 200:
-        return None, f"Page returned HTTP {r.status_code}."
+        return [], {}, f"Page returned HTTP {r.status_code}."
 
-    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", r.text, flags=re.S | re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).lower()
+    lines = _visible_text(r.text)
+    joined = " ".join(lines).lower()
+    if re.search(r"(sign in|log in|username|password)", joined) and len(joined) < 6000:
+        return [], {}, ("The link looks like a login page. Most journal portals need a "
+                        "signed-in session, so the details can't be read automatically.")
 
-    if re.search(r"(sign in|log in|username|password)", text) and len(text) < 6000:
-        return None, "The link appears to be a login page — journal portals need a session, so auto-check can't read it."
+    details, seen = [], set()
+    for line in lines:
+        pair = None
+        if "|" in line:
+            bits = [b.strip() for b in line.split("|") if b.strip()]
+            if len(bits) == 2:
+                pair = (bits[0], bits[1])
+        if pair is None and ":" in line:
+            lab, _, val = line.partition(":")
+            lab, val = lab.strip(), val.strip()
+            if lab and val and len(lab) <= 60 and len(val) <= 300:
+                pair = (lab, val)
+        if pair:
+            key = pair[0].lower()
+            if key not in seen:
+                seen.add(key)
+                details.append(pair)
 
-    for pattern, status in AUTO_PATTERNS:
-        if re.search(pattern, text):
-            return status, f"Matched '{status}' on the page."
-    return None, "Page fetched, but no recognisable status text found."
+    fields = {}
+    for label, value in details:
+        low = label.lower().strip(" *#")
+        for field, keys in FIELD_HINTS.items():
+            if field in fields:
+                continue
+            if any(low == k or low.startswith(k) for k in keys):
+                fields[field] = value
+
+    if "status" in fields:
+        low = fields["status"].lower()
+        for pattern, canonical in AUTO_PATTERNS:
+            if re.search(pattern, low):
+                fields["status"] = canonical
+                break
+    else:
+        for pattern, canonical in AUTO_PATTERNS:
+            if re.search(pattern, joined):
+                fields["status"] = canonical
+                break
+
+    if not details and "status" not in fields:
+        return [], {}, "Page fetched, but no recognisable details were found on it."
+    return details, fields, f"Read {len(details)} field(s) from the page."
+
+
+def fetch_status_from_link(url):
+    """Kept for the dashboard refresh: returns (status_or_None, note)."""
+    details, fields, note = scrape_tracking_page(url)
+    return fields.get("status"), note
 
 
 def run_auto_check(paper_row, silent=False):
-    status, note = fetch_status_from_link(paper_row["tracking_link"])
+    details, fields, note = scrape_tracking_page(paper_row["tracking_link"])
+    status = fields.get("status")
     c = conn()
     c.execute(
-        "UPDATE papers SET last_auto_check = ?, last_auto_result = ? WHERE id = ?",
-        (now(), note, paper_row["id"]),
+        """UPDATE papers SET last_auto_check = ?, last_auto_result = ?,
+           fetched_details = ? WHERE id = ?""",
+        (now(), note, json.dumps(details) if details else None, paper_row["id"]),
     )
+    # fill in blanks the journal page told us about
+    for col in ("manuscript_number", "date_submitted", "journal_name"):
+        if fields.get(col) and not paper_row.get(col):
+            c.execute(f"UPDATE papers SET {col} = ? WHERE id = ?",
+                      (fields[col], paper_row["id"]))
     c.commit()
     c.close()
     if status:
@@ -418,8 +508,7 @@ def paper_card(p, expanded=False):
     authors = authors_of(p["id"])
     names = ", ".join(a["name"] for a in authors) or "—"
     with st.expander(f"**{p['title']}** · {p['journal_name'] or 'no journal'} · `{p['status']}`", expanded=expanded):
-        c1, c2 = st.columns([2, 1])
-        with c1:
+        with st.container():
             st.markdown(
                 f"- **Manuscript no.:** {p['manuscript_number'] or '—'}\n"
                 f"- **Initial submission:** {p['date_submitted'] or '—'}\n"
@@ -433,12 +522,10 @@ def paper_card(p, expanded=False):
                 st.markdown(f"[Open journal tracking page]({p['tracking_link']})")
             if p["last_auto_check"]:
                 st.caption(f"Last auto-check {p['last_auto_check']} — {p['last_auto_result']}")
-        with c2:
-            if p["file_path"] and os.path.exists(p["file_path"]):
-                with open(p["file_path"], "rb") as f:
-                    st.download_button("Download manuscript", f.read(),
-                                       file_name=os.path.basename(p["file_path"]),
-                                       key=f"dl{p['id']}")
+            if p.get("fetched_details"):
+                with st.popover("Details from the journal page"):
+                    for lab, val in json.loads(p["fetched_details"]):
+                        st.markdown(f"**{lab}:** {val}")
 
         st.markdown("**Status history**")
         h = history_of(p["id"])
@@ -533,20 +620,46 @@ def authors_view():
 def new_paper_view(user):
     st.subheader("Add a paper")
     users = all_users()
-    with st.form("newpaper", clear_on_submit=True):
-        title = st.text_input("Title of the paper *")
-        journal = st.text_input("Journal name")
-        mno = st.text_input("Manuscript number")
-        date_sub = st.date_input("Initial date submitted", value=dt.date.today())
-        no_date = st.checkbox("Not submitted yet (ignore the date above)")
-        up = st.file_uploader("Submitted file", type=["pdf", "docx", "doc", "tex", "zip"])
+    st.caption("Only the title is required. Everything else can be filled in later.")
+
+    # --- optional: pull details straight off the journal tracking page ---
+    st.markdown("##### Journal tracking link (optional)")
+    lc1, lc2 = st.columns([4, 1])
+    link = lc1.text_input("Tracking link", key="np_link", label_visibility="collapsed",
+                          placeholder="https://...")
+    if lc2.button("Fetch details", use_container_width=True):
+        if not link.strip():
+            st.warning("Paste a tracking link first.")
+        else:
+            with st.spinner("Reading the journal page..."):
+                details, fields, note = scrape_tracking_page(link.strip())
+            st.session_state.np_fetched = details
+            st.session_state.np_fields = fields
+            (st.success if details else st.warning)(note)
+
+    fetched = st.session_state.get("np_fetched", [])
+    guess = st.session_state.get("np_fields", {})
+    if fetched:
+        st.markdown("**Everything found on that page:**")
+        st.dataframe([{"Field": lab, "Value": val} for lab, val in fetched],
+                     hide_index=True, use_container_width=True)
+        st.caption("The recognised fields are pre-filled below; edit anything that looks wrong.")
+
+    with st.form("newpaper"):
+        title = st.text_input("Title of the paper *", value=guess.get("title", ""))
+        journal = st.text_input("Journal name", value=guess.get("journal_name", ""))
+        mno = st.text_input("Manuscript number", value=guess.get("manuscript_number", ""))
+        date_sub = st.text_input("Initial date submitted", value=guess.get("date_submitted", ""),
+                                 placeholder="YYYY-MM-DD, or leave blank")
         coauthors = st.multiselect(
             "Co-authors", [u["email"] for u in users if u["id"] != user["id"]]
         )
         mode = st.radio("Status source", ["manual", "auto"], horizontal=True,
-                        help="Use manual before the paper goes under review; switch to auto once the journal gives you a tracking link.")
-        status = st.selectbox("Current status", STATUSES, index=1)
-        link = st.text_input("Journal tracking link (for auto mode)")
+                        index=1 if fetched else 0,
+                        help="Manual before the paper goes under review; auto once the "
+                             "journal has given you a tracking link.")
+        default_status = guess.get("status") if guess.get("status") in STATUSES else "Submitted to Journal"
+        status = st.selectbox("Current status", STATUSES, index=STATUSES.index(default_status))
         notes = st.text_area("Notes")
         ok = st.form_submit_button("Save paper", type="primary")
 
@@ -554,20 +667,17 @@ def new_paper_view(user):
         if not title.strip():
             st.error("A title is required.")
             return
-        path = None
-        if up is not None:
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", up.name)
-            path = os.path.join(UPLOAD_DIR, f"{int(dt.datetime.now().timestamp())}_{safe}")
-            with open(path, "wb") as f:
-                f.write(up.getbuffer())
         c = conn()
         cur = c.execute(
             """INSERT INTO papers (title, journal_name, manuscript_number, date_submitted,
-               file_path, status, status_mode, tracking_link, notes, owner_id, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (title.strip(), journal.strip(), mno.strip(),
-             None if no_date else str(date_sub), path, status, mode,
-             link.strip() or None, notes.strip(), user["id"], now(), now()),
+               file_path, status, status_mode, tracking_link, notes, fetched_details,
+               owner_id, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (title.strip(), journal.strip() or None, mno.strip() or None,
+             date_sub.strip() or None, None, status, mode,
+             link.strip() or None, notes.strip() or None,
+             json.dumps(fetched) if fetched else None,
+             user["id"], now(), now()),
         )
         pid = cur.lastrowid
         c.execute("INSERT INTO paper_authors (paper_id, user_id, author_order) VALUES (?,?,0)",
@@ -578,10 +688,12 @@ def new_paper_view(user):
                 c.execute("INSERT OR IGNORE INTO paper_authors (paper_id, user_id, author_order) VALUES (?,?,?)",
                           (pid, u["id"], i))
         c.execute("INSERT INTO status_history (paper_id, status, source, changed_at) VALUES (?,?,?,?)",
-                  (pid, status, "manual", now()))
+                  (pid, status, "auto" if fetched else "manual", now()))
         c.commit()
         c.close()
-        st.success("Paper saved.")
+        st.session_state.pop("np_fetched", None)
+        st.session_state.pop("np_fields", None)
+        st.success(f"Saved '{title.strip()}'.")
 
 
 def manage_view(user):
@@ -605,22 +717,15 @@ def manage_view(user):
         status = st.selectbox("Current status", STATUSES, index=STATUSES.index(p["status"]))
         link = st.text_input("Journal tracking link", p["tracking_link"] or "")
         notes = st.text_area("Notes", p["notes"] or "")
-        newfile = st.file_uploader("Replace submitted file", type=["pdf", "docx", "doc", "tex", "zip"])
         save = st.form_submit_button("Update", type="primary")
 
     if save:
-        path = p["file_path"]
-        if newfile is not None:
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", newfile.name)
-            path = os.path.join(UPLOAD_DIR, f"{int(dt.datetime.now().timestamp())}_{safe}")
-            with open(path, "wb") as f:
-                f.write(newfile.getbuffer())
         c = conn()
         c.execute(
             """UPDATE papers SET title=?, journal_name=?, manuscript_number=?, date_submitted=?,
-               status_mode=?, tracking_link=?, notes=?, file_path=?, updated_at=? WHERE id=?""",
+               status_mode=?, tracking_link=?, notes=?, updated_at=? WHERE id=?""",
             (title.strip(), journal.strip(), mno.strip(), date_sub.strip() or None,
-             mode, link.strip() or None, notes.strip(), path, now(), p["id"]),
+             mode, link.strip() or None, notes.strip(), now(), p["id"]),
         )
         c.commit()
         c.close()
