@@ -45,77 +45,153 @@ CLOSED_LIKE = {"Rejected", "Withdrawn"}
 
 
 # --------------------------------------------------------------------------
-# Database
+# Database layer: SQLite locally, Postgres when DATABASE_URL is set.
+# All SQL below uses "?" placeholders; the wrapper rewrites them for Postgres
+# so the individual queries never have to change.
 # --------------------------------------------------------------------------
+def _database_url():
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        return url
+    try:
+        return st.secrets["DATABASE_URL"]
+    except Exception:
+        return None
+
+
+def _invite_code():
+    code = os.environ.get("INVITE_CODE")
+    if code:
+        return code
+    try:
+        return st.secrets["INVITE_CODE"]
+    except Exception:
+        return "changeme"
+
+
+INVITE_CODE = _invite_code()
+
+USE_PG = bool(_database_url())
+
+if USE_PG:
+    import psycopg
+    from psycopg.rows import dict_row
+
+
+class Cur:
+    def __init__(self, rows, lastrowid=None):
+        self._rows = rows
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return self._rows
+
+
+class DB:
+    def __init__(self):
+        if USE_PG:
+            self._c = psycopg.connect(_database_url(), row_factory=dict_row)
+        else:
+            self._c = sqlite3.connect(DB_PATH, check_same_thread=False)
+            self._c.row_factory = sqlite3.Row
+            self._c.execute("PRAGMA foreign_keys = ON")
+
+    def execute(self, sql, params=()):
+        want_id = False
+        if USE_PG:
+            sql = sql.replace("?", "%s")
+            head = sql.strip().upper()
+            if head.startswith("INSERT OR IGNORE"):
+                sql = sql.replace("INSERT OR IGNORE", "INSERT", 1).rstrip().rstrip(";")
+                sql += " ON CONFLICT DO NOTHING"
+            elif head.startswith("INSERT"):
+                sql = sql.rstrip().rstrip(";") + " RETURNING id"
+                want_id = True
+        cur = self._c.cursor()
+        cur.execute(sql, params)
+        if want_id:
+            row = cur.fetchone()
+            return Cur([], row["id"] if row else None)
+        rows = []
+        if cur.description is not None:
+            rows = [dict(r) for r in cur.fetchall()]
+        return Cur(rows, None if USE_PG else cur.lastrowid)
+
+    def executescript(self, sql):
+        if USE_PG:
+            self._c.execute(sql)
+        else:
+            self._c.executescript(sql)
+
+    def commit(self):
+        self._c.commit()
+
+    def close(self):
+        self._c.close()
+
+
 def conn():
-    c = sqlite3.connect(DB_PATH, check_same_thread=False)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys = ON")
-    return c
+    return DB()
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'author',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS papers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    journal_name TEXT,
+    manuscript_number TEXT,
+    date_submitted TEXT,
+    file_path TEXT,
+    status TEXT NOT NULL DEFAULT 'Draft / Not submitted',
+    status_mode TEXT NOT NULL DEFAULT 'manual',
+    tracking_link TEXT,
+    last_auto_check TEXT,
+    last_auto_result TEXT,
+    notes TEXT,
+    owner_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_authors (
+    paper_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    author_order INTEGER DEFAULT 0,
+    PRIMARY KEY (paper_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    changed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS prior_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_id INTEGER NOT NULL,
+    journal_name TEXT NOT NULL,
+    date_submitted TEXT,
+    date_decided TEXT,
+    outcome TEXT,
+    comments_json TEXT NOT NULL DEFAULT '[]'
+);
+"""
 
 
 def init_db():
+    ddl = SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY") if USE_PG else SCHEMA
     c = conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'author',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS papers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            journal_name TEXT,
-            manuscript_number TEXT,
-            date_submitted TEXT,
-            file_path TEXT,
-            status TEXT NOT NULL DEFAULT 'Draft / Not submitted',
-            status_mode TEXT NOT NULL DEFAULT 'manual',
-            tracking_link TEXT,
-            last_auto_check TEXT,
-            last_auto_result TEXT,
-            notes TEXT,
-            owner_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (owner_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS paper_authors (
-            paper_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            author_order INTEGER DEFAULT 0,
-            PRIMARY KEY (paper_id, user_id),
-            FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS status_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            paper_id INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            source TEXT NOT NULL,
-            changed_at TEXT NOT NULL,
-            FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS prior_submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            paper_id INTEGER NOT NULL,
-            journal_name TEXT NOT NULL,
-            date_submitted TEXT,
-            date_decided TEXT,
-            outcome TEXT,
-            comments_json TEXT NOT NULL DEFAULT '[]',
-            FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE
-        );
-        """
-    )
+    c.executescript(ddl)
     c.commit()
     c.close()
 
@@ -324,8 +400,12 @@ def login_view():
         p = st.text_input("Password", type="password", key="rg_pw")
         role = st.selectbox("Role", ["corresponding", "author"], key="rg_role",
                             help="Corresponding authors can create and edit papers. Authors have read access.")
+        code = st.text_input("Invite code", type="password", key="rg_code",
+                             help="Ask the corresponding author for this.")
         if st.button("Create account"):
-            if not (n and e and p):
+            if code != INVITE_CODE:
+                st.error("Invalid invite code.")
+            elif not (n and e and p):
                 st.error("Fill in every field.")
             elif get_user_by_email(e):
                 st.error("That email is already registered.")
@@ -383,7 +463,7 @@ def paper_card(p, expanded=False):
 
 def dashboard_view(user):
     st.subheader("Common dashboard")
-    papers = papers_for_user(user["id"])
+    papers = papers_of_author(user["id"])
 
     active = [p for p in papers if p["status"] not in PUBLISHED_LIKE | CLOSED_LIKE]
     done = [p for p in papers if p["status"] in PUBLISHED_LIKE]
