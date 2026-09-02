@@ -59,6 +59,34 @@ def _database_url():
         return None
 
 
+def _admin_emails():
+    """Emails allowed to manage accounts. Comma separated, from env or secrets.
+    If unset, the first registered account is treated as the admin."""
+    raw = os.environ.get("ADMIN_EMAILS")
+    if not raw:
+        try:
+            raw = st.secrets["ADMIN_EMAILS"]
+        except Exception:
+            raw = ""
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+ADMIN_EMAILS = None  # resolved lazily, after st.secrets is reachable
+
+
+def is_admin(user):
+    global ADMIN_EMAILS
+    if ADMIN_EMAILS is None:
+        ADMIN_EMAILS = _admin_emails()
+    if ADMIN_EMAILS:
+        return user["email"].lower() in ADMIN_EMAILS
+    # no admin configured: the first account created is the admin
+    c = conn()
+    row = c.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()
+    c.close()
+    return bool(row) and row["id"] == user["id"]
+
+
 def _invite_code():
     code = os.environ.get("INVITE_CODE")
     if code:
@@ -308,6 +336,20 @@ def history_of(pid):
     ).fetchall()
     c.close()
     return rows
+
+
+def role_on_paper(user_id, paper):
+    """A person's role is a property of the paper, not of their account."""
+    if paper["owner_id"] == user_id:
+        return "corresponding"
+    return "co-author"
+
+
+def role_summary(user_id):
+    """How many papers this person is corresponding author on vs co-author."""
+    papers = papers_of_author(user_id)
+    corr = sum(1 for p in papers if p["owner_id"] == user_id)
+    return corr, len(papers) - corr
 
 
 def delete_paper(pid):
@@ -675,8 +717,8 @@ def login_view():
         n = st.text_input("Full name", key="rg_name")
         e = st.text_input("Email", key="rg_email")
         p = st.text_input("Password", type="password", key="rg_pw")
-        role = st.selectbox("Role", ["corresponding", "author"], key="rg_role",
-                            help="Corresponding authors can create and edit papers. Authors have read access.")
+        st.caption("You'll be the corresponding author on papers you add, and a "
+                   "co-author on papers others add you to. No role to pick.")
         code = st.text_input("Invite code", type="password", key="rg_code",
                              help="Ask the corresponding author for this.")
         if st.button("Create account"):
@@ -687,7 +729,7 @@ def login_view():
             elif get_user_by_email(e):
                 st.error("That email is already registered.")
             else:
-                create_user(n, e, p, role)
+                create_user(n, e, p, "author")
                 st.success("Account created — sign in from the other tab.")
 
 
@@ -793,7 +835,9 @@ def authors_view():
     tabs = st.tabs(labels)
     for tab, u in zip(tabs, users):
         with tab:
-            st.markdown(f"**{u['name']}** · {u['email']} · role: `{u['role']}`")
+            corr, co = role_summary(u["id"])
+            st.markdown(f"**{u['name']}** · {u['email']}")
+            st.caption(f"Corresponding author on {corr} paper(s), co-author on {co}.")
             ps = papers_of_author(u["id"])
             if not ps:
                 st.caption("No papers linked to this author.")
@@ -810,10 +854,54 @@ def authors_view():
                 paper_card(p)
 
 
+def account_view(user):
+    st.subheader("My account")
+    corr, co = role_summary(user["id"])
+    st.markdown(f"**{user['name']}** · {user['email']}")
+    st.caption(f"Corresponding author on {corr} paper(s), co-author on {co}.")
+
+    st.markdown("#### Change password")
+    with st.form("pwchange"):
+        old = st.text_input("Current password", type="password")
+        new1 = st.text_input("New password", type="password")
+        new2 = st.text_input("Repeat new password", type="password")
+        go = st.form_submit_button("Update password")
+    if go:
+        if hash_pw(old) != user["password_hash"]:
+            st.error("Current password is wrong.")
+        elif not new1 or new1 != new2:
+            st.error("The new passwords don't match.")
+        else:
+            c = conn()
+            c.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                      (hash_pw(new1), user["id"]))
+            c.commit()
+            c.close()
+            st.session_state.user["password_hash"] = hash_pw(new1)
+            st.success("Password updated.")
+
+    st.markdown("#### Close my account")
+    if corr:
+        st.info(f"You are the corresponding author on {corr} paper(s). Delete those "
+                "papers from 'Manage my papers' first, then you can close the account.")
+        return
+    st.warning("This removes your account and detaches you from any papers you are "
+               "listed on. The papers themselves stay.")
+    sure = st.checkbox("Yes, close my account")
+    if st.button("Close account", type="primary", disabled=not sure):
+        delete_user(user["id"])
+        st.session_state.pop("user", None)
+        st.success("Account closed.")
+        st.rerun()
+
+
 def users_view(current_user):
     st.subheader("Registered users")
-    st.caption("Accounts that own no papers can be removed here. Two accounts can "
-               "share a name, so check the email before deleting.")
+    if not is_admin(current_user):
+        st.error("Only the account administrator can manage accounts.")
+        return
+    st.caption("Accounts that are not corresponding author on any paper can be "
+               "removed here. Two accounts can share a name, so check the email.")
     users = all_users()
 
     rows = []
@@ -822,9 +910,9 @@ def users_view(current_user):
             "id": u["id"],
             "Name": u["name"],
             "Email": u["email"],
-            "Role": u["role"],
-            "Owns": owned_paper_count(u["id"]),
-            "On papers": len(papers_of_author(u["id"])),
+            "Corresponding on": owned_paper_count(u["id"]),
+            "Co-author on": len(papers_of_author(u["id"])) - owned_paper_count(u["id"]),
+            "Admin": "yes" if is_admin(u) else "",
             "Joined": u["created_at"][:10],
         })
     st.dataframe(rows, hide_index=True, use_container_width=True)
@@ -843,15 +931,15 @@ def users_view(current_user):
     if not others:
         st.caption("No other accounts.")
         return
-    label = {f"{u['name']} <{u['email']}> — owns {owned_paper_count(u['id'])} paper(s)": u
-             for u in others}
+    label = {f"{u['name']} <{u['email']}> — corresponding on "
+             f"{owned_paper_count(u['id'])} paper(s)": u for u in others}
     pick = st.selectbox("Account", list(label))
     target = label[pick]
     owned = owned_paper_count(target["id"])
 
     if owned:
         st.warning(f"{target['name']} is the corresponding author on {owned} paper(s). "
-                   "Delete or reassign those papers first.")
+                   "Those papers must be deleted or handed over first.")
         return
     st.write(f"Removing **{target['name']}** ({target['email']}) also detaches them "
              "from any papers they are listed on.")
@@ -1080,14 +1168,25 @@ def main():
 
     with st.sidebar:
         st.markdown(f"### {user['name']}")
-        st.caption(f"{user['email']} · {user['role']}")
+        corr, co = role_summary(user["id"])
+        bits = []
+        if corr:
+            bits.append(f"corresponding on {corr}")
+        if co:
+            bits.append(f"co-author on {co}")
+        st.caption(user["email"])
+        if bits:
+            st.caption(" · ".join(bits))
+        if is_admin(user):
+            st.caption("account administrator")
         if st.button("Sign out"):
             del st.session_state.user
             st.rerun()
         st.divider()
-        pages = ["Dashboard", "Authors"]
-        if user["role"] == "corresponding":
-            pages += ["Add paper", "Manage my papers", "Users"]
+        pages = ["Dashboard", "Authors", "Add paper", "Manage my papers"]
+        if is_admin(user):
+            pages.append("Users")
+        pages.append("My account")
         page = st.radio("Go to", pages)
 
     st.title("📄 PaperTrack")
@@ -1099,6 +1198,8 @@ def main():
         new_paper_view(user)
     elif page == "Users":
         users_view(user)
+    elif page == "My account":
+        account_view(user)
     else:
         manage_view(user)
 
