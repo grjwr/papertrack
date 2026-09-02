@@ -439,39 +439,94 @@ def _map_fields(details):
     return fields
 
 
+# Lines that are page furniture rather than data.
+NOISE = (
+    "is this helpful", "need more help", "we use cookies", "all content on this site",
+    "terms and conditions", "privacy policy", "copyright", "track your submission",
+    "this is a new submission", "watch to learn", "please visit our",
+    "peer review status", "detailed reviewer activity", "manuscript details",
+    "submission status and date", "cookienotice", "use of cookies",
+)
+
+# Headings whose value sits on the following line.
+HEADING_FIELDS = {
+    "article title": "title",
+    "manuscript title": "title",
+    "title": "title",
+}
+
+
+def _clean_line(line):
+    # markdown links -> their text, then drop bullets/whitespace
+    line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)
+    line = re.sub(r"^[\s*\-\u2022]+", "", line)
+    return re.sub(r"[ \t]+", " ", line).strip()
+
+
+def _is_noise(line):
+    low = line.lower()
+    if any(n in low for n in NOISE):
+        return True
+    # explanatory blurbs: "The meaning of X: ..." and long prose sentences
+    if low.startswith("the meaning of"):
+        return True
+    return False
+
+
 def parse_pasted_text(text):
     """Fallback: the user copies the tracking page (Ctrl+A, Ctrl+C) and pastes it.
     Works for every publisher, including ones behind a login."""
-    lines = [re.sub(r"[ \t]+", " ", l).strip() for l in text.splitlines()]
-    lines = [l for l in lines if l]
-    details, seen = [], set()
+    raw = [_clean_line(l) for l in text.splitlines()]
+    lines = [l for l in raw if l and not _is_noise(l)]
+
+    details, seen = [], {}
+    heading_title = None
     i = 0
     while i < len(lines):
         line = lines[i]
+        low = line.lower().rstrip(":").strip()
+
+        # "Article Title" on its own line, value on the next
+        if low in HEADING_FIELDS and i + 1 < len(lines):
+            nxt = lines[i + 1]
+            if ":" not in nxt or len(nxt) > 60:
+                heading_title = nxt
+                i += 2
+                continue
+
         if ":" in line:
             lab, _, val = line.partition(":")
             lab, val = lab.strip(), val.strip()
-            # "Journal:" on one line, "Neural Networks" on the next
+            # label on one line, value on the next
             if not val and i + 1 < len(lines) and ":" not in lines[i + 1]:
                 val = lines[i + 1].strip()
                 i += 1
-            if lab and val and len(lab) <= 60:
-                if lab.lower() not in seen:
-                    seen.add(lab.lower())
+            # a label should look like a label, not a sentence
+            if lab and val and len(lab) <= 45 and len(lab.split()) <= 6:
+                key = lab.lower()
+                if key not in seen:
+                    seen[key] = True
                     details.append((lab, val))
         i += 1
+
     fields = _map_fields(details)
+
     blob = " ".join(lines).lower()
     if not fields.get("status"):
         for pattern, canonical in AUTO_PATTERNS:
             if re.search(pattern, blob):
                 fields["status"] = canonical
                 break
-    if not fields.get("title"):
-        for l in lines:
-            if len(l) > 35 and ":" not in l and not l.lower().startswith("http"):
-                fields["title"] = re.sub(r"^\[[^\]]+\]\s*", "", l).strip()
-                break
+
+    title = heading_title
+    if not title:
+        # longest plausible line that isn't a label/value pair
+        cands = [l for l in lines
+                 if len(l) > 35 and ":" not in l and not l.lower().startswith("http")]
+        title = max(cands, key=len) if cands else None
+    if title:
+        fields["title"] = re.sub(r"^\[[^\]]+\]\s*", "", title).strip()
+
     note = f"Read {len(details)} field(s) from the pasted text." if details \
         else "Couldn't find any labelled fields in that text."
     return details, fields, note
