@@ -324,7 +324,7 @@ def prior_subs(pid):
 # --------------------------------------------------------------------------
 AUTO_PATTERNS = [
     (r"under\s+review", "Under Review"),
-    (r"reviews?\s+completed", "Required Reviews Completed"),
+    (r"reviews?\s+complete", "Required Reviews Completed"),
     (r"decision\s+in\s+process", "Decision in Process"),
     (r"with\s+editor", "With Editor"),
     (r"revi(?:se|sion)\s*[-–]?\s*major", "Major Revision"),
@@ -357,9 +357,124 @@ FIELD_HINTS = {
     "title": ("article title", "manuscript title", "title"),
     "journal_name": ("journal", "publication"),
     "date_submitted": ("date submitted", "submission date", "initial date submitted",
-                       "received", "date received", "submitted on"),
+                       "date of submission", "received", "date received", "submitted on"),
     "status": ("current status", "status", "stage", "editorial status"),
 }
+
+
+ELSEVIER_API = "https://tnlkuelk67.execute-api.us-east-1.amazonaws.com/tracker"
+
+
+def _prettify(key):
+    key = re.sub(r"(?<!^)(?=[A-Z])", " ", str(key)).replace("_", " ").replace("-", " ")
+    return key.strip().capitalize()
+
+
+def _flatten_json(obj, prefix=""):
+    """Turn arbitrary JSON into a flat list of (label, value) pairs."""
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            label = _prettify(k)
+            out.extend(_flatten_json(v, f"{prefix}{label} " if prefix else f"{label} "))
+    elif isinstance(obj, list):
+        if obj and all(not isinstance(i, (dict, list)) for i in obj):
+            out.append((prefix.strip() or "Items", ", ".join(str(i) for i in obj)))
+        else:
+            for i, item in enumerate(obj, 1):
+                out.extend(_flatten_json(item, f"{prefix}{i}. "))
+    else:
+        if obj not in (None, "", []):
+            out.append((prefix.strip(), str(obj)))
+    return out
+
+
+def scrape_elsevier(url):
+    """Elsevier Author Hub renders client-side; the data lives in a JSON API
+    keyed by the same uuid that appears in the tracking link."""
+    m = re.search(r"uuid=([0-9a-fA-F-]{16,})", url)
+    if not m:
+        return None
+    try:
+        r = requests.get(ELSEVIER_API, params={"uuid": m.group(1)}, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0 PaperTrack/1.0",
+                                  "Accept": "application/json",
+                                  "Origin": "https://track.authorhub.elsevier.com",
+                                  "Referer": "https://track.authorhub.elsevier.com/"})
+    except Exception as e:
+        return [], {}, f"Elsevier API request failed: {e}"
+    if r.status_code != 200:
+        return [], {}, f"Elsevier API returned HTTP {r.status_code}."
+    try:
+        data = r.json()
+    except Exception:
+        return [], {}, "Elsevier API did not return JSON."
+
+    details = _flatten_json(data)
+    fields = _map_fields(details)
+    if not fields.get("status"):
+        blob = " ".join(v for _, v in details).lower()
+        for pattern, canonical in AUTO_PATTERNS:
+            if re.search(pattern, blob):
+                fields["status"] = canonical
+                break
+    return details, fields, f"Read {len(details)} field(s) from Elsevier's tracker."
+
+
+def _map_fields(details):
+    fields = {}
+    for label, value in details:
+        low = label.lower().strip(" *#")
+        for field, keys in FIELD_HINTS.items():
+            if field in fields:
+                continue
+            if any(low == k or low.endswith(k) or low.startswith(k) for k in keys):
+                fields[field] = value
+    if "status" in fields:
+        low = fields["status"].lower()
+        for pattern, canonical in AUTO_PATTERNS:
+            if re.search(pattern, low):
+                fields["status"] = canonical
+                break
+    return fields
+
+
+def parse_pasted_text(text):
+    """Fallback: the user copies the tracking page (Ctrl+A, Ctrl+C) and pastes it.
+    Works for every publisher, including ones behind a login."""
+    lines = [re.sub(r"[ \t]+", " ", l).strip() for l in text.splitlines()]
+    lines = [l for l in lines if l]
+    details, seen = [], set()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if ":" in line:
+            lab, _, val = line.partition(":")
+            lab, val = lab.strip(), val.strip()
+            # "Journal:" on one line, "Neural Networks" on the next
+            if not val and i + 1 < len(lines) and ":" not in lines[i + 1]:
+                val = lines[i + 1].strip()
+                i += 1
+            if lab and val and len(lab) <= 60:
+                if lab.lower() not in seen:
+                    seen.add(lab.lower())
+                    details.append((lab, val))
+        i += 1
+    fields = _map_fields(details)
+    blob = " ".join(lines).lower()
+    if not fields.get("status"):
+        for pattern, canonical in AUTO_PATTERNS:
+            if re.search(pattern, blob):
+                fields["status"] = canonical
+                break
+    if not fields.get("title"):
+        for l in lines:
+            if len(l) > 35 and ":" not in l and not l.lower().startswith("http"):
+                fields["title"] = re.sub(r"^\[[^\]]+\]\s*", "", l).strip()
+                break
+    note = f"Read {len(details)} field(s) from the pasted text." if details \
+        else "Couldn't find any labelled fields in that text."
+    return details, fields, note
 
 
 def scrape_tracking_page(url):
@@ -374,6 +489,12 @@ def scrape_tracking_page(url):
         return [], {}, "The `requests` package is not installed."
     if not url or not url.startswith(("http://", "https://")):
         return [], {}, "No valid tracking URL saved."
+
+    if "authorhub.elsevier.com" in url:
+        res = scrape_elsevier(url)
+        if res is not None:
+            return res
+
     try:
         r = requests.get(url, timeout=20,
                          headers={"User-Agent": "Mozilla/5.0 PaperTrack/1.0"})
@@ -406,22 +527,8 @@ def scrape_tracking_page(url):
                 seen.add(key)
                 details.append(pair)
 
-    fields = {}
-    for label, value in details:
-        low = label.lower().strip(" *#")
-        for field, keys in FIELD_HINTS.items():
-            if field in fields:
-                continue
-            if any(low == k or low.startswith(k) for k in keys):
-                fields[field] = value
-
-    if "status" in fields:
-        low = fields["status"].lower()
-        for pattern, canonical in AUTO_PATTERNS:
-            if re.search(pattern, low):
-                fields["status"] = canonical
-                break
-    else:
+    fields = _map_fields(details)
+    if not fields.get("status"):
         for pattern, canonical in AUTO_PATTERNS:
             if re.search(pattern, joined):
                 fields["status"] = canonical
@@ -622,20 +729,39 @@ def new_paper_view(user):
     users = all_users()
     st.caption("Only the title is required. Everything else can be filled in later.")
 
-    # --- optional: pull details straight off the journal tracking page ---
-    st.markdown("##### Journal tracking link (optional)")
-    lc1, lc2 = st.columns([4, 1])
-    link = lc1.text_input("Tracking link", key="np_link", label_visibility="collapsed",
-                          placeholder="https://...")
-    if lc2.button("Fetch details", use_container_width=True):
-        if not link.strip():
-            st.warning("Paste a tracking link first.")
-        else:
-            with st.spinner("Reading the journal page..."):
-                details, fields, note = scrape_tracking_page(link.strip())
-            st.session_state.np_fetched = details
-            st.session_state.np_fields = fields
-            (st.success if details else st.warning)(note)
+    # --- optional: pull details off the journal tracking page ---
+    st.markdown("##### Import details (optional)")
+    t_link, t_paste = st.tabs(["From tracking link", "From pasted page"])
+
+    with t_link:
+        lc1, lc2 = st.columns([4, 1])
+        link = lc1.text_input("Tracking link", key="np_link", label_visibility="collapsed",
+                              placeholder="https://...")
+        if lc2.button("Fetch details", use_container_width=True):
+            if not link.strip():
+                st.warning("Paste a tracking link first.")
+            else:
+                with st.spinner("Reading the journal page..."):
+                    details, fields, note = scrape_tracking_page(link.strip())
+                st.session_state.np_fetched = details
+                st.session_state.np_fields = fields
+                (st.success if details else st.warning)(note)
+        st.caption("Works for Elsevier Author Hub links. Portals that need a login "
+                   "can't be read this way — use the other tab for those.")
+
+    with t_paste:
+        st.caption("Open the tracking page in your browser, select everything "
+                   "(Ctrl+A), copy (Ctrl+C), and paste it below.")
+        pasted = st.text_area("Pasted page", key="np_paste", height=140,
+                              label_visibility="collapsed")
+        if st.button("Read pasted text"):
+            if not pasted.strip():
+                st.warning("Paste the page contents first.")
+            else:
+                details, fields, note = parse_pasted_text(pasted)
+                st.session_state.np_fetched = details
+                st.session_state.np_fields = fields
+                (st.success if details else st.warning)(note)
 
     fetched = st.session_state.get("np_fetched", [])
     guess = st.session_state.get("np_fields", {})
