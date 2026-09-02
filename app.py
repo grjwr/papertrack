@@ -310,6 +310,31 @@ def history_of(pid):
     return rows
 
 
+def delete_paper(pid):
+    c = conn()
+    for table in ("prior_submissions", "status_history", "paper_authors"):
+        c.execute(f"DELETE FROM {table} WHERE paper_id = ?", (pid,))
+    c.execute("DELETE FROM papers WHERE id = ?", (pid,))
+    c.commit()
+    c.close()
+
+
+def owned_paper_count(user_id):
+    c = conn()
+    row = c.execute("SELECT COUNT(*) AS n FROM papers WHERE owner_id = ?", (user_id,)).fetchone()
+    c.close()
+    return row["n"] if row else 0
+
+
+def delete_user(user_id):
+    """Only safe for users who own no papers; their co-author links are removed."""
+    c = conn()
+    c.execute("DELETE FROM paper_authors WHERE user_id = ?", (user_id,))
+    c.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    c.commit()
+    c.close()
+
+
 def prior_subs(pid):
     c = conn()
     rows = c.execute(
@@ -668,7 +693,7 @@ def login_view():
 
 def paper_card(p, expanded=False):
     authors = authors_of(p["id"])
-    names = ", ".join(a["name"] for a in authors) or "—"
+    names = ", ".join(f"{a['name']} ({a['email']})" for a in authors) or "—"
     with st.expander(f"**{p['title']}** · {p['journal_name'] or 'no journal'} · `{p['status']}`", expanded=expanded):
         with st.container():
             st.markdown(
@@ -759,7 +784,13 @@ def authors_view():
     if not users:
         st.info("No users yet.")
         return
-    tabs = st.tabs([u["name"] for u in users])
+    # two people can share a name, so disambiguate the tab labels by email
+    seen_names = {}
+    for u in users:
+        seen_names[u["name"]] = seen_names.get(u["name"], 0) + 1
+    labels = [f"{u['name']} · {u['email'].split('@')[0]}" if seen_names[u["name"]] > 1
+              else u["name"] for u in users]
+    tabs = st.tabs(labels)
     for tab, u in zip(tabs, users):
         with tab:
             st.markdown(f"**{u['name']}** · {u['email']} · role: `{u['role']}`")
@@ -777,6 +808,58 @@ def authors_view():
             )
             for p in ps:
                 paper_card(p)
+
+
+def users_view(current_user):
+    st.subheader("Registered users")
+    st.caption("Accounts that own no papers can be removed here. Two accounts can "
+               "share a name, so check the email before deleting.")
+    users = all_users()
+
+    rows = []
+    for u in users:
+        rows.append({
+            "id": u["id"],
+            "Name": u["name"],
+            "Email": u["email"],
+            "Role": u["role"],
+            "Owns": owned_paper_count(u["id"]),
+            "On papers": len(papers_of_author(u["id"])),
+            "Joined": u["created_at"][:10],
+        })
+    st.dataframe(rows, hide_index=True, use_container_width=True)
+
+    dupes = {}
+    for u in users:
+        dupes.setdefault(u["name"].strip().lower(), []).append(u)
+    repeated = {k: v for k, v in dupes.items() if len(v) > 1}
+    if repeated:
+        st.info("These names belong to more than one account: " +
+                "; ".join(f"{v[0]['name']} → " + ", ".join(x["email"] for x in v)
+                          for v in repeated.values()))
+
+    st.markdown("#### Remove an account")
+    others = [u for u in users if u["id"] != current_user["id"]]
+    if not others:
+        st.caption("No other accounts.")
+        return
+    label = {f"{u['name']} <{u['email']}> — owns {owned_paper_count(u['id'])} paper(s)": u
+             for u in others}
+    pick = st.selectbox("Account", list(label))
+    target = label[pick]
+    owned = owned_paper_count(target["id"])
+
+    if owned:
+        st.warning(f"{target['name']} is the corresponding author on {owned} paper(s). "
+                   "Delete or reassign those papers first.")
+        return
+    st.write(f"Removing **{target['name']}** ({target['email']}) also detaches them "
+             "from any papers they are listed on.")
+    sure = st.checkbox("Yes, remove this account", key=f"udel{target['id']}")
+    if st.button("Remove account", type="primary", disabled=not sure):
+        delete_user(target["id"])
+        st.success(f"Removed {target['email']}.")
+        st.rerun()
 
 
 def new_paper_view(user):
@@ -919,6 +1002,17 @@ def manage_view(user):
             run_auto_check(p)
             st.rerun()
 
+    st.markdown("#### Danger zone")
+    with st.expander("Delete this paper"):
+        st.warning(f"This permanently removes '{p['title']}' along with its status "
+                   "history and previous-submission records. It cannot be undone.")
+        sure = st.checkbox("Yes, I want to delete this paper", key=f"delchk{p['id']}")
+        if st.button("Delete permanently", type="primary", disabled=not sure,
+                     key=f"delbtn{p['id']}"):
+            delete_paper(p["id"])
+            st.success("Paper deleted.")
+            st.rerun()
+
     st.markdown("#### Co-authors")
     current = {a["id"] for a in authors_of(p["id"])}
     others = [u for u in all_users() if u["id"] != user["id"]]
@@ -993,7 +1087,7 @@ def main():
         st.divider()
         pages = ["Dashboard", "Authors"]
         if user["role"] == "corresponding":
-            pages += ["Add paper", "Manage my papers"]
+            pages += ["Add paper", "Manage my papers", "Users"]
         page = st.radio("Go to", pages)
 
     st.title("📄 PaperTrack")
@@ -1003,6 +1097,8 @@ def main():
         authors_view()
     elif page == "Add paper":
         new_paper_view(user)
+    elif page == "Users":
+        users_view(user)
     else:
         manage_view(user)
 
