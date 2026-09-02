@@ -338,6 +338,36 @@ def history_of(pid):
     return rows
 
 
+def insert_paper(user, title, journal=None, date_sub=None, mno=None,
+                 status="Published", mode="manual", link=None, notes=None,
+                 details=None, coauthor_ids=()):
+    c = conn()
+    cur = c.execute(
+        """INSERT INTO papers (title, journal_name, manuscript_number, date_submitted,
+           file_path, status, status_mode, tracking_link, notes, fetched_details,
+           owner_id, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (title, journal or None, mno or None, date_sub or None, None, status, mode,
+         link or None, notes or None, json.dumps(details) if details else None,
+         user["id"], now(), now()),
+    )
+    pid = cur.lastrowid
+    c.execute("INSERT INTO paper_authors (paper_id, user_id, author_order) VALUES (?,?,0)",
+              (pid, user["id"]))
+    for i, uid in enumerate(coauthor_ids, 1):
+        c.execute("INSERT OR IGNORE INTO paper_authors (paper_id, user_id, author_order) VALUES (?,?,?)",
+                  (pid, uid, i))
+    c.execute("INSERT INTO status_history (paper_id, status, source, changed_at) VALUES (?,?,?,?)",
+              (pid, status, mode, now()))
+    c.commit()
+    c.close()
+    return pid
+
+
+def existing_titles(user_id):
+    return {p["title"].strip().lower() for p in papers_of_author(user_id)}
+
+
 def role_on_paper(user_id, paper):
     """A person's role is a property of the paper, not of their account."""
     if paper["owner_id"] == user_id:
@@ -429,7 +459,134 @@ FIELD_HINTS = {
 }
 
 
-ELSEVIER_API = "https://tnlkuelk67.execute-api.us-east-1.amazonaws.com/tracker"
+ELSEVIER_ENDPOINTS = (
+    "https://tnlkuelk67.execute-api.us-east-1.amazonaws.com/tracker",
+    "https://tnlkuelk67.execute-api.us-east-1.amazonaws.com/prod/tracker",
+    "https://tnlkuelk67.execute-api.us-east-1.amazonaws.com/api/tracker",
+)
+
+# ---------------------------------------------------------------------------
+# Published-work lookup (OpenAlex + Crossref). Both are free and keyless.
+# ---------------------------------------------------------------------------
+OPENALEX = "https://api.openalex.org"
+CROSSREF = "https://api.crossref.org"
+POLITE = {"User-Agent": "PaperTrack/1.0 (mailto:papertrack@example.org)"}
+
+
+def _oa_get(path, params):
+    r = requests.get(f"{OPENALEX}{path}", params=params, timeout=25, headers=POLITE)
+    r.raise_for_status()
+    return r.json()
+
+
+def _work_to_row(w):
+    """Normalise an OpenAlex work into the fields this app stores."""
+    loc = (w.get("primary_location") or {}).get("source") or {}
+    inv = w.get("abstract_inverted_index")
+    authors = [(a.get("author") or {}).get("display_name")
+               for a in (w.get("authorships") or [])]
+    return {
+        "title": w.get("display_name") or w.get("title") or "",
+        "journal_name": loc.get("display_name") or "",
+        "year": w.get("publication_year"),
+        "date": w.get("publication_date") or "",
+        "doi": (w.get("doi") or "").replace("https://doi.org/", ""),
+        "type": w.get("type") or "",
+        "cited_by": w.get("cited_by_count"),
+        "authors": ", ".join(a for a in authors if a),
+        "url": w.get("doi") or (w.get("primary_location") or {}).get("landing_page_url") or "",
+        "_has_abstract": bool(inv),
+    }
+
+
+def openalex_find_authors(name):
+    """Resolve a name to candidate author profiles (names are ambiguous)."""
+    try:
+        data = _oa_get("/authors", {"search": name, "per_page": 8})
+    except Exception as e:
+        return [], f"Author lookup failed: {e}"
+    out = []
+    for a in data.get("results", []):
+        inst = (a.get("last_known_institutions") or [{}])
+        inst_name = inst[0].get("display_name") if inst else None
+        if not inst_name:
+            inst_name = ((a.get("last_known_institution") or {}) or {}).get("display_name")
+        out.append({
+            "id": (a.get("id") or "").rsplit("/", 1)[-1],
+            "name": a.get("display_name") or "",
+            "orcid": (a.get("orcid") or "").replace("https://orcid.org/", ""),
+            "works": a.get("works_count") or 0,
+            "institution": inst_name or "",
+        })
+    if not out:
+        return [], f"No author profiles matched '{name}'."
+    return out, f"Found {len(out)} matching profile(s)."
+
+
+def openalex_works(author_id=None, orcid=None, limit=200):
+    """Every work by one author, newest first."""
+    if orcid:
+        filt = f"author.orcid:{orcid.strip()}"
+    elif author_id:
+        filt = f"author.id:{author_id.strip()}"
+    else:
+        return [], "Provide an ORCID or pick an author profile."
+    rows, page = [], 1
+    try:
+        while len(rows) < limit:
+            data = _oa_get("/works", {"filter": filt, "per_page": 50, "page": page,
+                                      "sort": "publication_date:desc"})
+            batch = data.get("results", [])
+            if not batch:
+                break
+            rows.extend(_work_to_row(w) for w in batch)
+            if len(batch) < 50:
+                break
+            page += 1
+    except Exception as e:
+        if rows:
+            return rows, f"Fetched {len(rows)} work(s) before an error: {e}"
+        return [], f"Lookup failed: {e}"
+    if not rows:
+        return [], "That profile has no works listed."
+    return rows[:limit], f"Found {len(rows[:limit])} published work(s)."
+
+
+def crossref_by_doi(doi):
+    """Single-paper lookup, useful when you already have the DOI."""
+    doi = doi.strip().replace("https://doi.org/", "").replace("doi:", "")
+    try:
+        r = requests.get(f"{CROSSREF}/works/{doi}", timeout=20, headers=POLITE)
+        if r.status_code != 200:
+            return None, f"Crossref returned HTTP {r.status_code} for that DOI."
+        m = r.json().get("message", {})
+    except Exception as e:
+        return None, f"Crossref request failed: {e}"
+    title = (m.get("title") or [""])[0]
+    journal = (m.get("container-title") or [""])[0]
+    parts = ((m.get("published") or {}).get("date-parts") or [[]])[0]
+    date = "-".join(f"{p:02d}" if i else str(p) for i, p in enumerate(parts)) if parts else ""
+    authors = ", ".join(
+        " ".join(x for x in (a.get("given"), a.get("family")) if x)
+        for a in (m.get("author") or [])
+    )
+    return {
+        "title": title, "journal_name": journal, "date": date,
+        "year": parts[0] if parts else None, "doi": doi, "authors": authors,
+        "type": m.get("type") or "", "url": m.get("URL") or f"https://doi.org/{doi}",
+        "cited_by": m.get("is-referenced-by-count"),
+    }, f"Found: {title[:60]}"
+
+
+def parse_scholar_url(url):
+    """Google Scholar has no public API and blocks automated access, so we can
+    only pull the profile name out of the URL and search OpenAlex with it."""
+    m = re.search(r"[?&]user=([A-Za-z0-9_-]+)", url)
+    if m:
+        return None, ("Google Scholar doesn't offer an API and blocks automated "
+                      "requests, so profiles can't be read from the link. Search by "
+                      "name or ORCID below instead — OpenAlex covers the same papers.")
+    return None, "That doesn't look like a Google Scholar profile URL."
 
 
 def _prettify(key):
@@ -462,30 +619,44 @@ def scrape_elsevier(url):
     m = re.search(r"uuid=([0-9a-fA-F-]{16,})", url)
     if not m:
         return None
-    try:
-        r = requests.get(ELSEVIER_API, params={"uuid": m.group(1)}, timeout=20,
-                         headers={"User-Agent": "Mozilla/5.0 PaperTrack/1.0",
-                                  "Accept": "application/json",
-                                  "Origin": "https://track.authorhub.elsevier.com",
-                                  "Referer": "https://track.authorhub.elsevier.com/"})
-    except Exception as e:
-        return [], {}, f"Elsevier API request failed: {e}"
-    if r.status_code != 200:
-        return [], {}, f"Elsevier API returned HTTP {r.status_code}."
-    try:
-        data = r.json()
-    except Exception:
-        return [], {}, "Elsevier API did not return JSON."
+    uuid = m.group(1)
+    last = None
+    for endpoint in ELSEVIER_ENDPOINTS:
+        try:
+            r = requests.get(endpoint, params={"uuid": uuid}, timeout=20,
+                             headers={"User-Agent": "Mozilla/5.0 PaperTrack/1.0",
+                                      "Accept": "application/json",
+                                      "Origin": "https://track.authorhub.elsevier.com",
+                                      "Referer": "https://track.authorhub.elsevier.com/"})
+        except Exception as e:
+            last = f"request failed: {e}"
+            continue
+        if r.status_code != 200:
+            last = f"HTTP {r.status_code}"
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            last = "response was not JSON"
+            continue
+        details = _flatten_json(data)
+        if not details:
+            last = "the API returned an empty record"
+            continue
+        fields = _map_fields(details)
+        if not fields.get("status"):
+            blob = " ".join(v for _, v in details).lower()
+            for pattern, canonical in AUTO_PATTERNS:
+                if re.search(pattern, blob):
+                    fields["status"] = canonical
+                    break
+        return details, fields, f"Read {len(details)} field(s) from Elsevier's tracker."
 
-    details = _flatten_json(data)
-    fields = _map_fields(details)
-    if not fields.get("status"):
-        blob = " ".join(v for _, v in details).lower()
-        for pattern, canonical in AUTO_PATTERNS:
-            if re.search(pattern, blob):
-                fields["status"] = canonical
-                break
-    return details, fields, f"Read {len(details)} field(s) from Elsevier's tracker."
+    return [], {}, (
+        f"Elsevier's tracker API didn't answer ({last}). Their endpoint is private and "
+        "changes without notice, so this may simply no longer work. Use the "
+        "'From pasted page' tab — it gives the same result reliably."
+    )
 
 
 def _map_fields(details):
@@ -950,6 +1121,130 @@ def users_view(current_user):
         st.rerun()
 
 
+def published_import(user):
+    """Bulk-add already-published papers from OpenAlex (free, no key) or a DOI."""
+    st.caption("Add papers that are already published, without typing them in. "
+               "Data comes from OpenAlex, which indexes the same works as Google "
+               "Scholar. Scholar itself has no API and blocks automated access, so "
+               "a Scholar profile link can't be read directly.")
+
+    how = st.radio("Look up by", ["ORCID", "Author name", "DOI"], horizontal=True,
+                   key="pi_how")
+
+    if how == "DOI":
+        d1, d2 = st.columns([4, 1])
+        doi = d1.text_input("DOI", key="pi_doi", label_visibility="collapsed",
+                            placeholder="10.1016/j.neunet.2026.01.001")
+        if d2.button("Look up", use_container_width=True, key="pi_doi_btn"):
+            if not doi.strip():
+                st.warning("Enter a DOI first.")
+            else:
+                row, note = crossref_by_doi(doi)
+                st.session_state.pi_rows = [row] if row else []
+                (st.success if row else st.warning)(note)
+
+    elif how == "ORCID":
+        o1, o2 = st.columns([4, 1])
+        orcid = o1.text_input("ORCID", key="pi_orcid", label_visibility="collapsed",
+                              placeholder="0000-0002-1825-0097")
+        if o2.button("Fetch works", use_container_width=True, key="pi_orcid_btn"):
+            if not orcid.strip():
+                st.warning("Enter an ORCID first.")
+            else:
+                with st.spinner("Querying OpenAlex..."):
+                    rows, note = openalex_works(orcid=orcid)
+                st.session_state.pi_rows = rows
+                (st.success if rows else st.warning)(note)
+        st.caption("An ORCID gives an exact match. Find yours at orcid.org.")
+
+    else:
+        n1, n2 = st.columns([4, 1])
+        name = n1.text_input("Author name", key="pi_name", label_visibility="collapsed",
+                             placeholder="Rajiv Gurjwar")
+        if n2.button("Find author", use_container_width=True, key="pi_name_btn"):
+            if not name.strip():
+                st.warning("Enter a name first.")
+            else:
+                with st.spinner("Searching OpenAlex..."):
+                    cands, note = openalex_find_authors(name)
+                st.session_state.pi_cands = cands
+                (st.success if cands else st.warning)(note)
+
+        cands = st.session_state.get("pi_cands", [])
+        if cands:
+            st.caption("Names are ambiguous, so pick the right profile:")
+            label = {f"{c['name']} — {c['institution'] or 'no institution listed'} "
+                     f"({c['works']} works)": c for c in cands}
+            pick = st.selectbox("Profile", list(label), key="pi_pick")
+            if st.button("Fetch this author's works", key="pi_works_btn"):
+                chosen = label[pick]
+                with st.spinner("Querying OpenAlex..."):
+                    rows, note = openalex_works(author_id=chosen["id"],
+                                                orcid=chosen["orcid"] or None)
+                st.session_state.pi_rows = rows
+                (st.success if rows else st.warning)(note)
+
+    rows = st.session_state.get("pi_rows", [])
+    if not rows:
+        return
+
+    already = existing_titles(user["id"])
+    fresh = [r for r in rows if r["title"].strip().lower() not in already]
+    dupes = len(rows) - len(fresh)
+    st.markdown(f"**{len(rows)} work(s) found.**" +
+                (f" {dupes} already in your dashboard and hidden." if dupes else ""))
+    if not fresh:
+        st.info("Nothing new to add.")
+        return
+
+    years = sorted({r["year"] for r in fresh if r["year"]}, reverse=True)
+    if years:
+        lo, hi = st.select_slider("Published between", options=years[::-1],
+                                  value=(years[-1], years[0]), key="pi_years")
+        fresh = [r for r in fresh if r["year"] and lo <= r["year"] <= hi]
+
+    only_articles = st.checkbox("Journal articles only", value=True, key="pi_arts")
+    if only_articles:
+        fresh = [r for r in fresh if r["type"] in ("article", "journal-article", "")]
+
+    st.caption("Tick the ones to add. Everything is saved with status 'Published'.")
+    table = [{"Add": True, "Title": r["title"], "Journal": r["journal_name"],
+              "Year": r["year"], "DOI": r["doi"], "Citations": r["cited_by"]}
+             for r in fresh]
+    edited = st.data_editor(
+        table, hide_index=True, use_container_width=True, key="pi_editor",
+        column_config={"Add": st.column_config.CheckboxColumn(required=True),
+                       "Title": st.column_config.TextColumn(width="large")},
+        disabled=["Title", "Journal", "Year", "DOI", "Citations"],
+    )
+
+    users = all_users()
+    co = st.multiselect("Add these co-authors to every imported paper",
+                        [u["email"] for u in users if u["id"] != user["id"]],
+                        key="pi_co")
+    co_ids = [get_user_by_email(e)["id"] for e in co]
+
+    chosen = [r for r, e in zip(fresh, edited) if e.get("Add")]
+    if st.button(f"Import {len(chosen)} paper(s)", type="primary",
+                 disabled=not chosen, key="pi_import"):
+        added = 0
+        for r in chosen:
+            details = [(k, str(v)) for k, v in
+                       (("Journal", r["journal_name"]), ("Year", r["year"]),
+                        ("DOI", r["doi"]), ("Authors", r["authors"]),
+                        ("Type", r["type"]), ("Citations", r["cited_by"]))
+                       if v not in (None, "", [])]
+            insert_paper(user, r["title"], journal=r["journal_name"],
+                         date_sub=r["date"] or (str(r["year"]) if r["year"] else None),
+                         status="Published", mode="manual",
+                         link=r["url"] or None,
+                         notes=f"DOI: {r['doi']}" if r["doi"] else None,
+                         details=details, coauthor_ids=co_ids)
+            added += 1
+        st.session_state.pop("pi_rows", None)
+        st.success(f"Imported {added} published paper(s). They're on the dashboard now.")
+
+
 def new_paper_view(user):
     st.subheader("Add a paper")
     users = all_users()
@@ -957,7 +1252,8 @@ def new_paper_view(user):
 
     # --- optional: pull details off the journal tracking page ---
     st.markdown("##### Import details (optional)")
-    t_link, t_paste = st.tabs(["From tracking link", "From pasted page"])
+    t_link, t_paste, t_pub = st.tabs(
+        ["From tracking link", "From pasted page", "Import published papers"])
 
     with t_link:
         lc1, lc2 = st.columns([4, 1])
@@ -988,6 +1284,9 @@ def new_paper_view(user):
                 st.session_state.np_fetched = details
                 st.session_state.np_fields = fields
                 (st.success if details else st.warning)(note)
+
+    with t_pub:
+        published_import(user)
 
     fetched = st.session_state.get("np_fetched", [])
     guess = st.session_state.get("np_fields", {})
